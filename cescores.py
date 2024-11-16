@@ -15,6 +15,8 @@ import unicodedata
 import difflib
 from io import BytesIO
 
+from rapidocr_onnxruntime import RapidOCR
+
 COLUMN_IGN = 4
 COLUMN_CE_SCORE = 6
 COLUMN_CLAN_NAME = 7
@@ -123,7 +125,8 @@ async def setup(bot):
     await bot.add_cog(USCEScoreCog(bot))
 
 async def get_ce_scores(attachment, interaction: discord.Interaction, bot):
-
+    engine = RapidOCR()
+    
     async def download_image(url):
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
@@ -137,97 +140,138 @@ async def get_ce_scores(attachment, interaction: discord.Interaction, bot):
             thread = await bot.fetch_channel(interaction.channel_id) 
             await thread.send(text)
 
-    def process_center(image_bytes):
+    def resize(img):
+        h,w = img.shape[:2]
+        new_h = int((h/1080)*720)
+        new_w = int((w/1080)*720)
+        return cv2.resize(img,(new_w,new_h))
+
+    def crop(img):
+        h,w = img.shape[:2]
+        return img[350:h-275,150:w-75,:]
+
+    def extract(result):
+        data = []
+        players = {}
+        for r in result:
+            text = r[1]
+            if text.isdigit():
+                score = text
+                players = (name,score)
+                data.append(players)
+                name = score = ''
+            else:
+                name = text
+        return data
+
+    def process_image(image_bytes):
         img = cv2.imdecode(np.frombuffer(image_bytes.getvalue(), np.uint8), cv2.IMREAD_COLOR)
-        # return process_image(img)
-        height, width = img.shape[0], img.shape[1]
-
-        # # cropt the top 5th and bottom 5th
-        # quarter_height = height // 9
-        # center = img[0:int(.9*height), 121:width-121]
-        center = img[:, 121:width-121]
-        return process_image(center)
-
-    def process_image(image):
-        cv2.imwrite('temp.png', image)
-
-        content = cv2.imencode('.png', image)[1].tobytes()
-
-        credentials = service_account.Credentials.from_service_account_file('./scripts/config/procrastinazn-jefabot.json')
-        client = vision.ImageAnnotatorClient(credentials=credentials)
-
-        # Set language hints (for en, jp, kr, cn)
-        image_context = vision.ImageContext(
-            language_hints=["en", "ja", "ko", "zh"]
-        )
-        response = client.text_detection(image=vision.Image(content=content), image_context=image_context)
-        texts = [text.description.strip() for text in response.text_annotations]
-        # After filtering emojis from texts, perform replacement
-        texts = [text.replace("⚫", "ㆍ") for text in texts]
-        return texts
-
-    async def filter_scores(texts):
-        sub = texts[0].split("\n")[3:]
-        await reply_if_testing_channel(f"All texts: `{sub}`")
+        resized = resize(img)
+        cropped = crop(resized)
+        result, elapse = engine(cropped)
+        name_score_pairs = extract(result)
         
-        # Find the index where "Current" or "Only the best result" starts
-        cutoff_index = None
-        for i, item in enumerate(sub):
-            if item.startswith("Current") or item.startswith("Only the best result"):
-                cutoff_index = i
-                break
-
-        # Filter out elements after the found index
-        filtered_data = sub[:cutoff_index] if cutoff_index is not None else sub
-
-        # Updated pattern to match "A**" or "S**", where ** are digits, and anything after
-        pattern = re.compile(r'^[AS$]\d{2}.*$', re.IGNORECASE)
-
-        # Define a list of substrings that should not be contained in any item
-        excluded_substrings = ["expedition boss"]
-
-        # Filtering the list
-        separated = [
-            item for item in filtered_data
-            if (len(item) > 1) 
-            and (len(item) >= 3 or item.isdigit())                              # Keep items with 3+ chars or digits
-            and item != "Member Result"                                         # Remove "Member Result"
-            and not item.lower() in ['1:]'] # Special case
-            and not pattern.match(item)                                         # Exclude items matching "AxxY" pattern
-            and all(substring.lower() not in item.lower() for substring in excluded_substrings)  # Case-insensitive exclusion
-        ]
-
-        await reply_if_testing_channel(f"Separated: `{separated}`")
-
-        # Filter to extract only name-score pairs (ignoring first "Member Result")
-        name_score_pairs = [(separated[i], separated[i + 1]) for i in range(0, len(separated) - 1, 2)]
-        await reply_if_testing_channel(f"Tuples: `{name_score_pairs}`")
-
-        # Check if all second values are integers. If they're not, then split names + scores and try to pair them
-        if not all(isinstance(item[1], int) for item in name_score_pairs):
-            # Splitting the data into lists of strings and integers
-            names = [item for item in separated if not item.isdigit()]
-            # Between 40 and 150 scores
-            numbers = [int(item) for item in separated if item.isdigit() and 40 <= int(item) <= 150]
-            name_score_pairs = list(zip(names, numbers))
-            await reply_if_testing_channel(f"(Updated) Tuples: `{name_score_pairs}`")
-
-        # Convert scores to integers and collect them for top 30 calculation
         scores = [int(score) for _, score in name_score_pairs if str(score).isdigit()]
         top_30_sum = sum(sorted(scores, reverse=True)[:30])  # Sum of top 30 scores
-
+        
         # Create a TSV format as a string
         # tsv_output = "\n".join([f"{name}\t{score}" for name, score in name_score_pairs])
         # tsv_output += f"\n\nTop 30 total: {top_30_sum} (Total rows: {len(name_score_pairs)})"
-
         # await reply_if_testing_channel(f"top 30 sum: `{top_30_sum}`")
+        
         return name_score_pairs
+    
+    # def process_center(image_bytes):
+    #     img = cv2.imdecode(np.frombuffer(image_bytes.getvalue(), np.uint8), cv2.IMREAD_COLOR)
+    #     # return process_image(img)
+    #     height, width = img.shape[0], img.shape[1]
+
+    #     # # cropt the top 5th and bottom 5th
+    #     # quarter_height = height // 9
+    #     # center = img[0:int(.9*height), 121:width-121]
+    #     center = img[:, 121:width-121]
+    #     return process_image(center)
+
+    # def process_image(image):
+    #     cv2.imwrite('temp.png', image)
+
+    #     content = cv2.imencode('.png', image)[1].tobytes()
+
+    #     credentials = service_account.Credentials.from_service_account_file('./scripts/config/procrastinazn-jefabot.json')
+    #     client = vision.ImageAnnotatorClient(credentials=credentials)
+
+    #     # Set language hints (for en, jp, kr, cn)
+    #     image_context = vision.ImageContext(
+    #         language_hints=["en", "ja", "ko", "zh"]
+    #     )
+    #     response = client.text_detection(image=vision.Image(content=content), image_context=image_context)
+    #     texts = [text.description.strip() for text in response.text_annotations]
+    #     # After filtering emojis from texts, perform replacement
+    #     texts = [text.replace("⚫", "ㆍ") for text in texts]
+    #     return texts
+
+    # async def filter_scores(texts):
+    #     sub = texts[0].split("\n")[3:]
+    #     await reply_if_testing_channel(f"All texts: `{sub}`")
+        
+    #     # Find the index where "Current" or "Only the best result" starts
+    #     cutoff_index = None
+    #     for i, item in enumerate(sub):
+    #         if item.startswith("Current") or item.startswith("Only the best result"):
+    #             cutoff_index = i
+    #             break
+
+    #     # Filter out elements after the found index
+    #     filtered_data = sub[:cutoff_index] if cutoff_index is not None else sub
+
+    #     # Updated pattern to match "A**" or "S**", where ** are digits, and anything after
+    #     pattern = re.compile(r'^[AS$]\d{2}.*$', re.IGNORECASE)
+
+    #     # Define a list of substrings that should not be contained in any item
+    #     excluded_substrings = ["expedition boss"]
+
+    #     # Filtering the list
+    #     separated = [
+    #         item for item in filtered_data
+    #         if (len(item) > 1) 
+    #         and (len(item) >= 3 or item.isdigit())                              # Keep items with 3+ chars or digits
+    #         and item != "Member Result"                                         # Remove "Member Result"
+    #         and not item.lower() in ['1:]'] # Special case
+    #         and not pattern.match(item)                                         # Exclude items matching "AxxY" pattern
+    #         and all(substring.lower() not in item.lower() for substring in excluded_substrings)  # Case-insensitive exclusion
+    #     ]
+
+    #     await reply_if_testing_channel(f"Separated: `{separated}`")
+
+    #     # Filter to extract only name-score pairs (ignoring first "Member Result")
+    #     name_score_pairs = [(separated[i], separated[i + 1]) for i in range(0, len(separated) - 1, 2)]
+    #     await reply_if_testing_channel(f"Tuples: `{name_score_pairs}`")
+
+    #     # Check if all second values are integers. If they're not, then split names + scores and try to pair them
+    #     if not all(isinstance(item[1], int) for item in name_score_pairs):
+    #         # Splitting the data into lists of strings and integers
+    #         names = [item for item in separated if not item.isdigit()]
+    #         # Between 40 and 150 scores
+    #         numbers = [int(item) for item in separated if item.isdigit() and 40 <= int(item) <= 150]
+    #         name_score_pairs = list(zip(names, numbers))
+    #         await reply_if_testing_channel(f"(Updated) Tuples: `{name_score_pairs}`")
+
+    #     # Convert scores to integers and collect them for top 30 calculation
+    #     scores = [int(score) for _, score in name_score_pairs if str(score).isdigit()]
+    #     top_30_sum = sum(sorted(scores, reverse=True)[:30])  # Sum of top 30 scores
+
+    #     # Create a TSV format as a string
+    #     # tsv_output = "\n".join([f"{name}\t{score}" for name, score in name_score_pairs])
+    #     # tsv_output += f"\n\nTop 30 total: {top_30_sum} (Total rows: {len(name_score_pairs)})"
+
+    #     # await reply_if_testing_channel(f"top 30 sum: `{top_30_sum}`")
+    #     return name_score_pairs
     
     image_data = await download_image(attachment.url)
     if image_data:
-        texts = process_center(image_data)
-        await reply_if_testing_channel(f"Texts: `{texts[0]}`")
-        scores = await filter_scores(texts)
+        # texts = process_center(image_data)
+        # await reply_if_testing_channel(f"Texts: `{texts[0]}`")
+        scores = await process_image(image_data)
         return scores
         # await interaction.response.send_message(f"```{tsv_scores}\n```", ephemeral=True)
     else:
